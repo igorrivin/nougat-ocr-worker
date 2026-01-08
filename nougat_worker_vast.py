@@ -33,6 +33,26 @@ load_dotenv()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+# GCS bucket for arXiv PDFs (accessible via HTTPS, no rate limits)
+ARXIV_GCS_BASE = "https://storage.googleapis.com/arxiv-dataset/arxiv"
+
+
+def get_gcs_pdf_url(arxiv_id: str, version: str = "v1") -> str:
+    """Get GCS URL for a paper's PDF.
+
+    GCS format:
+    - New style (YYMM.NNNNN): .../arxiv/pdf/YYMM/YYMM.NNNNNvV.pdf
+    - Old style (cat/YYMMNNN): .../cat/pdf/YYMM/YYMMNNNvV.pdf
+    """
+    if '/' in arxiv_id:  # Old format: math.GT/0401234
+        cat, number = arxiv_id.split('/', 1)
+        cat_prefix = cat.split('.')[0]  # "math" from "math.GT"
+        yymm = number[:4]
+        return f"{ARXIV_GCS_BASE}/{cat_prefix}/pdf/{yymm}/{number}{version}.pdf"
+    else:  # New format: 1234.56789
+        yymm = arxiv_id.split('.')[0][:4]
+        return f"{ARXIV_GCS_BASE}/arxiv/pdf/{yymm}/{arxiv_id}{version}.pdf"
+
 
 def get_supabase():
     """Get Supabase client."""
@@ -42,18 +62,31 @@ def get_supabase():
 
 
 def download_pdf(arxiv_id: str, output_path: str) -> bool:
-    """Download PDF from arXiv to a file."""
-    url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    """Download PDF from GCS bucket (with fallback to arxiv.org)."""
+    # Try GCS first (no rate limits)
+    for version in ["v1", "v2", "v3"]:
+        url = get_gcs_pdf_url(arxiv_id, version)
+        try:
+            resp = requests.get(url, timeout=120)
+            if resp.status_code == 200 and resp.content[:4] == b'%PDF':
+                with open(output_path, 'wb') as f:
+                    f.write(resp.content)
+                return True
+        except Exception:
+            continue
+
+    # Fallback to arxiv.org (rate limited, but works for edge cases)
     try:
+        url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
         resp = requests.get(url, timeout=120)
-        if resp.status_code == 200:
+        if resp.status_code == 200 and resp.content[:4] == b'%PDF':
             with open(output_path, 'wb') as f:
                 f.write(resp.content)
             return True
-        return False
     except Exception as e:
         print(f"Download error for {arxiv_id}: {e}")
-        return False
+
+    return False
 
 
 def run_nougat(pdf_path: str, output_dir: str, model: str = "small") -> dict:
@@ -81,7 +114,7 @@ def run_nougat(pdf_path: str, output_dir: str, model: str = "small") -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=600  # 10 min timeout per paper
+            timeout=1200  # 20 min timeout per paper
         )
 
         # Check for output file regardless of exit code (segfault writes output first)

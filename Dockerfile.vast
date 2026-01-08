@@ -1,0 +1,30 @@
+# Dockerfile for Nougat OCR Worker on vast.ai
+# Build: docker build -f Dockerfile.vast -t nougat-worker .
+# Run:   docker run --gpus all -e SUPABASE_URL=... -e SUPABASE_KEY=... nougat-worker
+
+FROM nvcr.io/nvidia/pytorch:24.05-py3
+
+WORKDIR /workspace/nougat-ocr-worker
+
+# Install dependencies in correct order (version pinning matters!)
+RUN pip install --no-cache-dir \
+    albumentations==1.3.1 \
+    pypdfium2==4.16.0 \
+    nougat-ocr \
+    supabase \
+    python-dotenv \
+    tqdm \
+    requests
+
+# Pre-download nougat model (base) to bake into image
+RUN python -c "from nougat import NougatModel; NougatModel.from_pretrained('0.1.0-base')" || true
+
+# Pre-download NLTK data
+RUN python -c "import nltk; nltk.download('words')"
+
+# Copy worker files
+COPY nougat_worker_vast.py .
+COPY .env* ./
+
+# Default command
+CMD ["python", "nougat_worker_vast.py", "--workers", "4", "--batch-size", "10", "--model", "base"]
