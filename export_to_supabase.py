@@ -11,8 +11,11 @@ Usage:
 import os
 import argparse
 import psycopg2
+from dotenv import load_dotenv
 from supabase import create_client
 from tqdm import tqdm
+
+load_dotenv()
 
 
 # Local database config

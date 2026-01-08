@@ -18,6 +18,9 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from multiprocessing import Process, Queue
 import queue
 
+from dotenv import load_dotenv
+load_dotenv()
+
 warnings.filterwarnings("ignore")
 
 import torch
