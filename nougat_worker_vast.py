@@ -23,6 +23,7 @@ from multiprocessing import Process, Queue
 import queue
 
 import requests
+import fitz  # PyMuPDF for page counting
 from dotenv import load_dotenv
 from supabase import create_client
 from tqdm import tqdm
@@ -89,7 +90,18 @@ def download_pdf(arxiv_id: str, output_path: str) -> bool:
     return False
 
 
-def run_nougat(pdf_path: str, output_dir: str, model: str = "small") -> dict:
+def count_pdf_pages(pdf_path: str) -> int:
+    """Count pages in a PDF file."""
+    try:
+        doc = fitz.open(pdf_path)
+        count = len(doc)
+        doc.close()
+        return count
+    except Exception:
+        return 0
+
+
+def run_nougat(pdf_path: str, output_dir: str, model: str = "small", gpu_id: int = 0) -> dict:
     """Run nougat CLI on a PDF file."""
     result = {
         "success": False,
@@ -109,12 +121,17 @@ def run_nougat(pdf_path: str, output_dir: str, model: str = "small") -> dict:
             "-m", f"0.1.0-{model}"
         ]
 
+        # Explicitly set CUDA_VISIBLE_DEVICES in subprocess environment
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
         # Run with timeout, ignore segfault since output is written before crash
         process = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=1200  # 20 min timeout per paper
+            timeout=1200,  # 20 min timeout per paper
+            env=env
         )
 
         # Check for output file regardless of exit code (segfault writes output first)
@@ -152,9 +169,6 @@ def gpu_worker(gpu_id: int, task_queue: Queue, result_queue: Queue, model: str):
     """Worker process for a single GPU."""
     print(f"[GPU {gpu_id}] Starting...")
 
-    # Set CUDA device for this worker
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     while True:
         try:
             task = task_queue.get(timeout=60)
@@ -176,13 +190,18 @@ def gpu_worker(gpu_id: int, task_queue: Queue, result_queue: Queue, model: str):
                         "success": False,
                         "error": "PDF download failed",
                         "pages": [],
+                        "page_count": 0,
                         "processing_time": 0
                     })
                     continue
 
-                # Run nougat
-                result = run_nougat(pdf_path, output_dir, model)
+                # Count pages before processing
+                page_count = count_pdf_pages(pdf_path)
+
+                # Run nougat on specific GPU
+                result = run_nougat(pdf_path, output_dir, model, gpu_id)
                 result["arxiv_id"] = arxiv_id
+                result["page_count"] = page_count
                 result_queue.put(result)
 
         except queue.Empty:
@@ -194,9 +213,10 @@ def gpu_worker(gpu_id: int, task_queue: Queue, result_queue: Queue, model: str):
     print(f"[GPU {gpu_id}] Shutting down")
 
 
-def save_results_to_supabase(supabase, result: dict):
+def save_results_to_supabase(supabase, result: dict, worker_id: str):
     """Save OCR results to Supabase."""
     arxiv_id = result["arxiv_id"]
+    page_count = result.get("page_count", 0)
 
     if result["success"]:
         # Save page results
@@ -208,17 +228,20 @@ def save_results_to_supabase(supabase, result: dict):
                 "char_count": page["char_count"]
             }, on_conflict="arxiv_id,page_number").execute()
 
-        # Update queue status
+        # Update queue status with page_count and worker_id for analysis
         supabase.table("ocr_queue").update({
             "status": "completed",
             "completed_at": "now()",
-            "processing_time_seconds": result["processing_time"]
+            "page_count": page_count,
+            "processing_time_seconds": result["processing_time"],
+            "worker_id": worker_id
         }).eq("arxiv_id", arxiv_id).execute()
     else:
         # Mark as failed
         supabase.table("ocr_queue").update({
             "status": "failed",
-            "error_message": result["error"]
+            "error_message": result["error"],
+            "worker_id": worker_id
         }).eq("arxiv_id", arxiv_id).execute()
 
 
@@ -227,13 +250,16 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="Number of GPU workers")
     parser.add_argument("--batch-size", type=int, default=10, help="Papers to claim per batch")
     parser.add_argument("--worker-id", type=str, default=None, help="Unique worker ID")
+    parser.add_argument("--gpu-type", type=str, default="unknown",
+                        help="GPU type for cost analysis (e.g., '4xRTX5080', '4xRTX5090')")
     parser.add_argument("--model", type=str, default="base", choices=["small", "base"],
                         help="Nougat model size (default: base)")
     args = parser.parse_args()
 
-    print(f"Starting with {args.workers} workers using nougat-{args.model}")
+    print(f"Starting with {args.workers} workers using nougat-{args.model} on {args.gpu_type}")
 
-    worker_id = args.worker_id or f"vast-{os.getpid()}"
+    # Worker ID includes GPU type for cost analysis
+    worker_id = args.worker_id or f"{args.gpu_type}-{os.getpid()}"
     supabase = get_supabase()
 
     # Create queues
@@ -277,16 +303,21 @@ def main():
 
             # Collect results
             collected = 0
+            total_pages = 0
+            batch_start = time.time()
             while collected < len(papers):
                 try:
-                    result = result_queue.get(timeout=660)  # 11 min timeout
-                    save_results_to_supabase(supabase, result)
+                    result = result_queue.get(timeout=1260)  # 21 min timeout (slightly > processing timeout)
+                    save_results_to_supabase(supabase, result, worker_id)
                     collected += 1
                     total_processed += 1
 
                     if result["success"]:
                         total_success += 1
-                        status = f"OK ({result['processing_time']:.1f}s)"
+                        page_count = result.get("page_count", 0)
+                        total_pages += page_count
+                        pages_per_sec = page_count / result["processing_time"] if result["processing_time"] > 0 else 0
+                        status = f"OK {page_count}pp in {result['processing_time']:.1f}s ({pages_per_sec:.2f} pp/s)"
                     else:
                         total_failed += 1
                         status = f"FAILED: {result['error']}"
@@ -297,7 +328,9 @@ def main():
                     print("Timeout waiting for results")
                     break
 
-            print(f"Progress: {total_success} success, {total_failed} failed")
+            batch_elapsed = time.time() - batch_start
+            batch_pps = total_pages / batch_elapsed if batch_elapsed > 0 else 0
+            print(f"Progress: {total_success} success, {total_failed} failed | Batch: {total_pages} pages in {batch_elapsed:.1f}s ({batch_pps:.1f} pp/s)")
 
     except KeyboardInterrupt:
         print("\nShutting down...")
