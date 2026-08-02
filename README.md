@@ -5,10 +5,23 @@ Designed to run on vast.ai with results stored in Supabase.
 
 ## Performance
 
-| Setup | Speed | 5,784 papers | Cost |
-|-------|-------|--------------|------|
-| 1x GH200 | 1,240 pp/hr | 47 hours | - |
-| 4x RTX 5090 | ~5,000 pp/hr | ~10 hours | ~$12 |
+Measured with `nougat-base` model:
+
+| Setup | Speed | Pages/hr | 5,784 papers (~100K pages) | Cost |
+|-------|-------|----------|---------------------------|------|
+| 4x RTX 5080 | ~0.13 pp/s/GPU | ~1,800 | ~60 hours | ~$31 |
+| 4x RTX 5090 | ~0.2 pp/s/GPU (est) | ~2,800 | ~40 hours | ~$50 |
+
+- Average: **~7-8 seconds per page**
+- Throughput is memory-bandwidth bound, not compute bound
+- GPU utilization typically 20-35%
+
+### Full Math arXiv Corpus (720K papers)
+
+| Setup | Time | Cost (est) |
+|-------|------|------------|
+| 1x 4xRTX5080 box | ~7,400 hours | ~$3,800 |
+| 10x parallel boxes | ~740 hours | ~$3,800 |
 
 ## Quick Start
 
@@ -22,14 +35,16 @@ Designed to run on vast.ai with results stored in Supabase.
 
 ### 2. Export Papers to Queue
 
-On your local machine:
+On your local machine, create a `.env` file:
 
 ```bash
-cd /home/igor/devel/nougat-ocr-worker
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_KEY=your-service-role-key
+```
 
-export SUPABASE_URL="https://xxx.supabase.co"
-export SUPABASE_KEY="your-service-role-key"
+Then export:
 
+```bash
 # Test first
 python export_to_supabase.py --dry-run
 
@@ -40,40 +55,54 @@ python export_to_supabase.py
 ### 3. Run on vast.ai
 
 1. Rent a machine:
-   - Search for 4x RTX 5090 (or 4090, A100, etc.)
+   - Search for 4x RTX 5080/5090 (or 4090, A100, etc.)
    - Use Docker image: `nvcr.io/nvidia/pytorch:24.05-py3`
-   - ~$1.15/hr for 4x RTX 5090
+   - 4x RTX 5080: ~$0.52/hr
+   - 4x RTX 5090: ~$1.20/hr
 
 2. SSH into the machine and run:
 
 ```bash
-# Clone this repo (or upload files)
-git clone https://github.com/YOUR_USERNAME/nougat-ocr-worker.git
+# Clone repo
+git clone https://github.com/igorrivin/nougat-ocr-worker.git
 cd nougat-ocr-worker
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (order matters!)
+pip install albumentations==1.3.1 pypdfium2==4.16.0 nougat-ocr
+pip install supabase python-dotenv tqdm PyMuPDF requests
 
-# Set credentials
-export SUPABASE_URL="https://xxx.supabase.co"
-export SUPABASE_KEY="your-service-role-key"
+# Create .env file
+cat > .env << 'EOF'
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_KEY=your-service-role-key
+EOF
 
-# Run with all GPUs
-python nougat_worker.py --workers 4 --batch-size 20
-
-# Or run in background
-nohup python nougat_worker.py --workers 4 --batch-size 20 > worker.log 2>&1 &
-tail -f worker.log
+# Run with all GPUs (use --gpu-type for cost analysis)
+python nougat_worker_vast.py --workers 4 --batch-size 12 --model base --gpu-type 4xRTX5080
 ```
+
+PDFs are downloaded from the GCS mirror (`gs://arxiv-dataset`) to avoid rate limiting.
 
 ### 4. Monitor Progress
 
 Check Supabase dashboard or run:
 
 ```sql
-SELECT status, COUNT(*)
+-- Overall progress
+SELECT status, COUNT(*), SUM(page_count) as pages
 FROM ocr_queue
 GROUP BY status;
+
+-- Performance by GPU type
+SELECT
+  split_part(worker_id, '-', 1) as gpu_type,
+  COUNT(*) as papers,
+  SUM(page_count) as pages,
+  ROUND(SUM(processing_time_seconds)::numeric, 0) as total_seconds,
+  ROUND((SUM(page_count) / NULLIF(SUM(processing_time_seconds), 0))::numeric, 3) as pages_per_sec
+FROM ocr_queue
+WHERE status = 'completed' AND page_count > 0
+GROUP BY split_part(worker_id, '-', 1);
 ```
 
 ### 5. Sync Results Back
@@ -81,19 +110,29 @@ GROUP BY status;
 On your local machine:
 
 ```bash
-export SUPABASE_URL="https://xxx.supabase.co"
-export SUPABASE_KEY="your-service-role-key"
-
 python sync_from_supabase.py
 ```
 
 ## Files
 
-- `nougat_worker.py` - Main worker script (runs on vast.ai)
+- `nougat_worker_vast.py` - Worker script for vast.ai (uses nougat-ocr package)
+- `nougat_worker.py` - Alternative worker using transformers directly (for GH200/other setups)
 - `export_to_supabase.py` - Export papers from local DB to Supabase queue
 - `sync_from_supabase.py` - Sync completed results back to local DB
 - `supabase_schema.sql` - Database schema for Supabase
+- `Dockerfile.vast` - Docker image for easy deployment
 - `requirements.txt` - Python dependencies
+
+## Docker Deployment
+
+Build and push (from an x86 machine or vast.ai):
+
+```bash
+docker build -f Dockerfile.vast -t yourusername/nougat-worker:latest .
+docker push yourusername/nougat-worker:latest
+```
+
+Then on vast.ai, use `yourusername/nougat-worker:latest` as the Docker image.
 
 ## Architecture
 
@@ -101,10 +140,10 @@ python sync_from_supabase.py
 Local PostgreSQL          Supabase              vast.ai
 ┌─────────────┐      ┌─────────────────┐    ┌──────────────┐
 │ papers      │      │ ocr_queue       │    │ GPU Workers  │
-│ (5,784 need │──────│ (pending jobs)  │────│ (4x RTX 5090)│
-│  OCR)       │export│                 │claim│              │
+│ (papers     │──────│ (pending jobs)  │────│ (4x RTX 5080)│
+│  need OCR)  │export│                 │claim│              │
 └─────────────┘      │ ocr_results     │────│ Nougat Model │
-       ▲             │ (page text)     │save│              │
+       ▲             │ (markdown text) │save│              │
        │             └─────────────────┘    └──────────────┘
        │ sync               │
        └────────────────────┘
@@ -112,7 +151,8 @@ Local PostgreSQL          Supabase              vast.ai
 
 ## Notes
 
-- Model: `facebook/nougat-small` (~350MB, fast)
-- For better quality: `facebook/nougat-base` (~1GB, slower)
-- The worker is fault-tolerant and resumable
-- Papers are claimed with row-level locking to support multiple workers
+- Model: `nougat-base` recommended for math papers (~1GB, better LaTeX quality)
+- Alternative: `nougat-small` (~350MB, faster but lower quality)
+- Worker is fault-tolerant and resumable
+- Papers are claimed with row-level locking to support multiple parallel workers
+- The `--gpu-type` flag tags results for cost/performance analysis across hardware
